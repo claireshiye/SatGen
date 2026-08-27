@@ -21,6 +21,7 @@
 #   transfer function from Green and van den Bosch (2019)
 
 #########################################################################
+from __future__ import annotations
 
 import config as cfg # for global variables
 import cosmo as co # for cosmology related functions
@@ -29,8 +30,9 @@ import warnings
 import numpy as np
 from scipy.optimize import brentq
 from scipy.interpolate import InterpolatedUnivariateSpline
-from scipy.integrate import quad,odeint
+from scipy.integrate import quad,odeint,cumtrapz
 from scipy.special import erf,gamma,gammainc,gammaincc 
+
 
 #---variables for NFW mass definition change interpolation
 x_interpolator = None
@@ -3909,3 +3911,199 @@ def Miso(r,rho):
     rhoave = np.append(rho[0],0.5*(rho[1:]+rho[:-1]))
     dM = cfg.FourPi * r**2 *dr * rhoave
     return dM.cumsum()
+
+"""
+NonParamSpherical: a non-parametric spherical density profile for SatGen.
+
+Usage:
+  from profiles_nonparam import NonParamSpherical
+  # r_grid in kpc, rho_grid in Msun/kpc^3
+  p = NonParamSpherical(r_grid, rho_grid, rvir=200.0)
+  p.rho(R)        # density at radius R (kpc)
+  p.M(R)          # enclosed mass inside r=R
+  p.Phi(R)        # potential at r=R
+  p.Vcirc(R)      # circular velocity at r=R
+  p.fgrav(R,z)    # gravitational accel components (R, phi, z)
+"""
+
+class NonParamSpherical:
+    def __init__(self, r_grid, rho_grid, rvir: float = None):
+        r = np.asarray(r_grid, dtype=float)
+        rho = np.asarray(rho_grid, dtype=float)
+        if r.ndim != 1 or rho.ndim != 1:
+            raise ValueError("r_grid and rho_grid must be 1D arrays")
+        if r.shape != rho.shape:
+            raise ValueError("r_grid and rho_grid must have same length")
+        if r.size < 2:
+            raise ValueError("Provide at least two radial points")
+
+        if not np.all(r[1:] > r[:-1]):
+            order = np.argsort(r)
+            r = r[order]
+            rho = rho[order]
+
+        if r[0] <= 0.0:
+            r_min = np.maximum(np.finfo(float).eps, r[1] * 1e-6 if r.size > 1 else 1e-8)
+            r[0] = r_min
+
+        # store grids under names that don't conflict with method names
+        self.r_grid = r
+        self.rho_grid = rho
+        self.rho0 = float(self.rho_grid[0])
+        
+        # --- 1. AUTO-PAD AN INFINITE TAIL ---
+        # Calculate the logarithmic slope of the density at the very edge of your data
+        # alpha = d(log rho) / d(log r). For dark matter halos, this is usually between -2 and -3.
+        alpha = np.log(self.rho_grid[-1] / self.rho_grid[-2]) / np.log(self.r_grid[-1] / self.r_grid[-2])
+        #print(alpha)
+        
+        # Safety net: Ensure the density is actually falling off (to prevent infinite mass)
+        alpha = min(alpha, -2.5) 
+        
+        # Generate an extended radius grid out to 1,00,000 kpc
+        # We use 100 logarithmic bins to cover the vast distance efficiently
+        r_tail = np.logspace(np.log10(self.r_grid[-1]) + 0.05, 5.0, 100)
+        
+        # Extrapolate the density using the calculated slope
+        rho_tail = self.rho_grid[-1] * (r_tail / self.r_grid[-1])**alpha
+
+        # Stitch the simulation grid and the analytical tail together for integration
+        r_full = np.concatenate((self.r_grid, r_tail))
+        rho_full = np.concatenate((self.rho_grid, rho_tail))
+
+        # --- 2. INTEGRATE ON THE FULL GRID ---
+        # Enclosed mass with inner core offset
+        integrand_M = 4.0 * np.pi * (r_full**2) * rho_full
+        M_initial = (4.0 / 3.0) * np.pi * (r_full[0]**3) * rho_full[0]
+        M_full = M_initial + cumtrapz(integrand_M, r_full, initial=0.0)
+
+        # Potential gradient
+        integrand_Phi = cfg.G * M_full / (r_full**2)
+        dPhi = cumtrapz(integrand_Phi, r_full, initial=0.0)
+
+        # Anchor at 10^6 kpc, where the mass outside is truly negligible
+        Phi_rmax = -cfg.G * M_full[-1] / r_full[-1]
+        Phi_full = Phi_rmax - (dPhi[-1] - dPhi)
+
+        # --- 3. TRIM BACK TO SIMULATION DATA ---
+        # We slice the arrays so your splines only cover your actual data grid,
+        # but they now possess the perfectly shifted potentials!
+        N = len(self.r_grid)
+        self.M_grid = M_full[:N]
+        self.Phi_grid = Phi_full[:N]        
+
+        #integrand = 4.0 * np.pi * (self.r_grid**2) * self.rho_grid
+        
+        # Estimate the tiny bit of mass inside the very first grid point
+        # Assuming constant density for that microscopic inner core: V * rho
+        #M_initial = (4.0 / 3.0) * np.pi * (self.r_grid[0]**3) * self.rho_grid[0]
+        
+        #M_cum = cumtrapz(integrand, self.r_grid, initial=0.0)
+        #self.M_grid = M_cum + M_initial  # Msun
+        #print('M_cum', M_cum)
+
+        self.rh = float(rvir) if (rvir is not None) else float(self.r_grid[-1])
+        self.Mh = float(self.M_grid[-1])
+
+        #int_M = np.concatenate(([0.0], cumtrapz(self.M_grid, self.r_grid)))
+
+        # Gravitational potential: dPhi/dr = G * M(r) / r^2
+        #integrand_Phi = cfg.G * self.M_grid / (self.r_grid**2)
+
+        # Integrate outwards from 0 to r. 
+        #dPhi = cumtrapz(integrand_Phi, self.r_grid, initial=0.0)
+
+        # Anchor the potential to the physical boundary condition at r_max
+        #Phi_rmax = -cfg.G * self.M_grid[-1] / self.r_grid[-1]
+
+        # Shift the integral to match the boundary condition
+        #Phi_grid = Phi_rmax - (dPhi[-1] - dPhi)
+        #self.Phi_grid = Phi_grid
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            Vc_grid = np.sqrt(np.maximum(0.0, cfg.G * self.M_grid / self.r_grid))
+        if not np.isfinite(Vc_grid[0]):
+            Vc_grid[0] = Vc_grid[1]
+        self.Vc_grid = Vc_grid
+
+        self.rmax = float(self.r_grid[np.nanargmax(self.Vc_grid)])
+        self.Vmax = float(np.nanmax(self.Vc_grid))
+
+        k = 3 if self.r_grid.size >= 4 else (2 if self.r_grid.size >= 3 else 1)
+
+        # spline names don't collide with method names either
+        self._rho_spline = InterpolatedUnivariateSpline(self.r_grid, self.rho_grid, k=k)
+        self._M_spline = InterpolatedUnivariateSpline(self.r_grid, self.M_grid, k=k)
+        self._Phi_spline = InterpolatedUnivariateSpline(self.r_grid, self.Phi_grid, k=k)
+        self._Vc_spline = InterpolatedUnivariateSpline(self.r_grid, self.Vc_grid, k=k)
+
+        self.ch = None
+        self.rs = None
+        self.f = lambda x: None
+
+    def _r_scalar_or_array(self, R, z=0.0):
+        R_arr, z_arr = np.broadcast_arrays(np.asarray(R), np.asarray(z))
+        r = np.sqrt(R_arr**2 + z_arr**2)
+        if np.asarray(R).shape == () and np.asarray(z).shape == ():
+            return float(r)
+        return r
+
+    def _maybe_return_scalar(self, out, inp):
+        inp_arr = np.asarray(inp)
+        if inp_arr.shape == ():
+            return float(np.atleast_1d(out).squeeze())
+        return np.asarray(out)
+
+    def rho(self, R, z=0.0):
+        r = self._r_scalar_or_array(R, z)
+        vals = self._rho_spline(np.atleast_1d(r))
+        return self._maybe_return_scalar(vals, R)
+
+    def M(self, R, z=0.0):
+        r = self._r_scalar_or_array(R, z)
+        vals = self._M_spline(np.atleast_1d(r))
+        return self._maybe_return_scalar(vals, R)
+
+    def Phi(self, R, z=0.0):
+        r = self._r_scalar_or_array(R, z)
+        vals = self._Phi_spline(np.atleast_1d(r))
+        return self._maybe_return_scalar(vals, R)
+
+    def Vcirc(self, R, z=0.0):
+        r = self._r_scalar_or_array(R, z)
+        vals = self._Vc_spline(np.atleast_1d(r))
+        return self._maybe_return_scalar(vals, R)
+
+    def fgrav(self, R, z):
+        r = self._r_scalar_or_array(R, z)
+        r_safe = np.where(np.asarray(r) == 0.0, np.minimum(self.r_grid[0], 1e-8), r)
+        Mval = self._M_spline(np.atleast_1d(r_safe))
+        fac = -cfg.G * Mval / (r_safe**3)
+        R_arr, z_arr = np.broadcast_arrays(np.asarray(R), np.asarray(z))
+        aR = fac * R_arr
+        aphi = np.zeros_like(aR)
+        az = fac * z_arr
+        return (self._maybe_return_scalar(aR, R),
+                self._maybe_return_scalar(aphi, R),
+                self._maybe_return_scalar(az, R))
+
+    def rhobar(self, R, z=0.0): 
+        '''Mean(average) density within some radius'''
+        r = self._r_scalar_or_array(R, z)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            vals = 3.0 / (4.0 * np.pi * r**3) * self.M(R, z)
+        return self._maybe_return_scalar(vals, R)
+
+    def tdyn(self, R, z=0.0):
+        return np.sqrt(cfg.ThreePiOverSixteenG / self.rhobar(R, z))
+
+    @classmethod
+    def from_mass_profile(cls, r_grid, M_grid, rvir: float = None):
+        r = np.asarray(r_grid, dtype=float)
+        M = np.asarray(M_grid, dtype=float)
+        if r.shape != M.shape:
+            raise ValueError("r_grid and M_grid must have same shape")
+        dM_dr = np.gradient(M, r)
+        rho = dM_dr / (4.0 * np.pi * r**2)
+        rho = np.nan_to_num(rho, nan=rho[~np.isnan(rho)][0] if np.any(~np.isnan(rho)) else 0.0)
+        return cls(r, rho, rvir=rvir)
